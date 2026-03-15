@@ -324,13 +324,15 @@ class InteractiveConfigEditor:
                                     self.config_dict['warehouse']['height'], self.font)
         self.slider_robots = Slider(px, py + 540, btn_w, "机器人数", 1, 30,
                                     self.config_dict['robot']['num_robots'], self.font)
+        self.slider_max_tasks = Slider(px, py + 590, btn_w, "任务数量", 1, 100,
+                                       self.config_dict['warehouse'].get('max_tasks', 20), self.font)
         
         self.buttons = [
             self.btn_shelf, self.btn_workstation, self.btn_obstacle,
             self.btn_charging, self.btn_erase,
             self.btn_clear, self.btn_load, self.btn_save, self.btn_run
         ]
-        self.sliders = [self.slider_width, self.slider_height, self.slider_robots]
+        self.sliders = [self.slider_width, self.slider_height, self.slider_robots, self.slider_max_tasks]
     
     def _screen_to_grid(self, sx: int, sy: int) -> Optional[Tuple[int, int]]:
         """屏幕坐标转网格坐标"""
@@ -362,7 +364,13 @@ class InteractiveConfigEditor:
             self._sync_config_from_grid()
     
     def _draw_grid(self):
-        """绘制编辑网格"""
+        """绘制编辑网格（工作站、充电站按配置列表顺序编号）"""
+        wh = self.config_dict.get('warehouse', {})
+        ws_positions = wh.get('workstation_positions', [])
+        charge_positions = wh.get('charging_stations') or []
+        ws_pos_to_id = {tuple(p): i for i, p in enumerate(ws_positions)}
+        charge_pos_to_id = {tuple(p): i for i, p in enumerate(charge_positions)}
+        
         for y in range(self.grid_h):
             for x in range(self.grid_w):
                 rect = pygame.Rect(
@@ -372,6 +380,18 @@ class InteractiveConfigEditor:
                 color = self._get_cell_color(self.edit_grid[y][x])
                 pygame.draw.rect(self.screen, color, rect)
                 pygame.draw.rect(self.screen, COLORS['grid_line'], rect, 1)
+                if self.edit_grid[y][x] == CELL_WORKSTATION:
+                    wid = ws_pos_to_id.get((x, y))
+                    if wid is not None:
+                        num_surf = self.small_font.render(str(wid), True, (255, 255, 255))
+                        tr = num_surf.get_rect(center=rect.center)
+                        self.screen.blit(num_surf, tr)
+                if self.edit_grid[y][x] == CELL_CHARGING:
+                    cid = charge_pos_to_id.get((x, y))
+                    if cid is not None:
+                        num_surf = self.small_font.render(str(cid), True, (255, 255, 255))
+                        tr = num_surf.get_rect(center=rect.center)
+                        self.screen.blit(num_surf, tr)
         
         # 绘制拖拽预览
         if self.mode == MODE_SHELF and self.drag_start and self.drag_end:
@@ -511,6 +531,7 @@ class InteractiveConfigEditor:
                         self._create_ui_components()
                 
                 self.config_dict['robot']['num_robots'] = self.slider_robots.value
+                self.config_dict['warehouse']['max_tasks'] = self.slider_max_tasks.value
                 
                 if event.type == pygame.MOUSEBUTTONDOWN:
                     # 按钮点击

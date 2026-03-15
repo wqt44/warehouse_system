@@ -34,6 +34,10 @@ class Robot:
     # 任务完成事件（用于奖励：在“完成那一步”给正奖励）
     just_completed_task: bool = False
     last_completed_task_id: Optional[int] = None
+    # 拿着货去充电时暂存的状态，充完后恢复
+    state_before_charge: Optional[RobotState] = None
+    # 交付完成后须离开到距该工作站至少 LEAVE_WORKSTATION_MIN_DISTANCE 格（由环境设置与清除）
+    last_dropoff_workstation: Optional[Tuple[int, int]] = None
     
     def __post_init__(self):
         if self.battery is None:

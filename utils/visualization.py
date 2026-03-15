@@ -49,8 +49,12 @@ class WarehouseVisualizer:
         self.small_font = pygame.font.Font(None, 14)
     
     def draw_grid(self, grid: np.ndarray):
-        """绘制网格"""
+        """绘制网格（工作站、充电站按配置顺序编号）"""
         grid_height, grid_width = grid.shape
+        ws_positions = getattr(self.warehouse_config, 'workstation_positions', None) or []
+        charge_positions = getattr(self.warehouse_config, 'charging_stations', None) or []
+        ws_pos_to_id = {tuple(p): i for i, p in enumerate(ws_positions)}
+        charge_pos_to_id = {tuple(p): i for i, p in enumerate(charge_positions)}
         
         for y in range(grid_height):
             for x in range(grid_width):
@@ -61,23 +65,34 @@ class WarehouseVisualizer:
                     self.cell_size,
                     self.cell_size
                 )
-                
-                # 根据单元格值选择颜色
-                if cell_value == 0:  # 空地
+                if cell_value == 0:
                     color = self.colors['empty']
-                elif cell_value == 1:  # 障碍物
+                elif cell_value == 1:
                     color = self.colors['obstacle']
-                elif cell_value == 2:  # 货架
+                elif cell_value == 2:
                     color = self.colors['shelf']
-                elif cell_value == 3:  # 工作站
+                elif cell_value == 3:
                     color = self.colors['workstation']
-                elif cell_value == 4:  # 充电站
+                elif cell_value == 4:
                     color = self.colors['charging']
                 else:
                     color = self.colors['empty']
-                
                 pygame.draw.rect(self.screen, color, rect)
-                pygame.draw.rect(self.screen, (200, 200, 200), rect, 1)  # 边框
+                pygame.draw.rect(self.screen, (200, 200, 200), rect, 1)
+                if cell_value == 3:
+                    wid = ws_pos_to_id.get((x, y))
+                    if wid is not None:
+                        num_surf = self.small_font.render(str(wid), True, (255, 255, 255))
+                        num_surf.set_alpha(220)
+                        tr = num_surf.get_rect(center=rect.center)
+                        self.screen.blit(num_surf, tr)
+                if cell_value == 4:
+                    cid = charge_pos_to_id.get((x, y))
+                    if cid is not None:
+                        num_surf = self.small_font.render(str(cid), True, (255, 255, 255))
+                        num_surf.set_alpha(220)
+                        tr = num_surf.get_rect(center=rect.center)
+                        self.screen.blit(num_surf, tr)
     
     def draw_robots(self, robots: List[Robot]):
         """绘制机器人"""

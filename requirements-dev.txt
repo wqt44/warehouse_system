@@ -1,0 +1,2 @@
+# 开发与测试依赖（在 requirements.txt 基础上安装）
+pytest>=7.0.0

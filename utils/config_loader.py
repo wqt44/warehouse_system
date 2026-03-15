@@ -24,19 +24,16 @@ def load_warehouse_config_from_dict(config_dict: Dict[str, Any]) -> WarehouseCon
     Returns:
         WarehouseConfig对象
     """
-    # 转换列表为元组
+    # 转换列表为元组；键存在但为空列表时保留 []，键不存在时为 None 由 WarehouseConfig.__post_init__ 填默认
     shelf_regions = None
-    if 'shelf_regions' in config_dict and config_dict['shelf_regions']:
-        shelf_regions = [tuple(region) for region in config_dict['shelf_regions']]
-    
+    if 'shelf_regions' in config_dict:
+        shelf_regions = [tuple(region) for region in config_dict['shelf_regions']] if config_dict['shelf_regions'] else []
     workstation_positions = None
-    if 'workstation_positions' in config_dict and config_dict['workstation_positions']:
-        workstation_positions = [tuple(pos) for pos in config_dict['workstation_positions']]
-    
+    if 'workstation_positions' in config_dict:
+        workstation_positions = [tuple(pos) for pos in config_dict['workstation_positions']] if config_dict['workstation_positions'] else []
     obstacle_positions = None
-    if 'obstacle_positions' in config_dict and config_dict['obstacle_positions']:
-        obstacle_positions = [tuple(pos) for pos in config_dict['obstacle_positions']]
-    
+    if 'obstacle_positions' in config_dict:
+        obstacle_positions = [tuple(pos) for pos in config_dict['obstacle_positions']] if config_dict['obstacle_positions'] else []
     charging_stations = None
     if 'charging_stations' in config_dict and config_dict['charging_stations']:
         charging_stations = [tuple(pos) for pos in config_dict['charging_stations']]

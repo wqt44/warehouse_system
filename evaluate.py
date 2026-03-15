@@ -13,7 +13,7 @@ from utils.plot_utils import setup_chinese_font
 setup_chinese_font()
 
 from config import ObservationConfig, TrainingConfig
-from env.warehouse_env import WarehouseEnv
+from env.warehouse_env import WarehouseEnv, LEAVE_WORKSTATION_MIN_DISTANCE
 from algorithms.mappo import MAPPO
 from models.task_allocator import TaskAllocatorNetwork
 from utils.metrics import MetricsCollector
@@ -49,21 +49,22 @@ def get_heuristic_action(robot, env: WarehouseEnv) -> int:
     if robot.state == RobotState.CHARGING and robot.battery < robot.max_battery * 0.9:
         return 4  # 等待充电
     
-    # 如果机器人正在返回充电站
+    # 如果机器人正在返回充电站：用 A* 寻路到己编号对应的充电站（与任务寻路一致，避免穿站、绕障）
     elif robot.state == RobotState.RETURNING_TO_CHARGE:
-        if env.charging_stations:
-            nearest_charging = min(env.charging_stations, 
-                                 key=lambda p: robot.get_distance_to(p))
-            dx = nearest_charging[0] - robot.position[0]
-            dy = nearest_charging[1] - robot.position[1]
-            if abs(dx) > abs(dy):
-                return 1 if dx > 0 else 3
-            elif dy != 0:
-                return 2 if dy > 0 else 0
-            else:
+        assigned = env.get_charging_station_for_robot(robot.robot_id)
+        if assigned:
+            if robot.is_at_position(assigned, tolerance=0):
                 return 4
-        else:
-            return 4
+            occupied = {r.position for r in env.robots if r.robot_id != robot.robot_id}
+            path = astar_path(
+                env.grid, env.width, env.height,
+                robot.position, assigned,
+                occupied=occupied,
+                allow_goal_on_shelf=False,
+            )
+            if path:
+                return path_to_action(path)
+        return 4
     
     # 如果有任务，用 A* 寻路到目标（能准确进入目标货物所在通道）
     if robot.current_task:
@@ -92,46 +93,51 @@ def get_heuristic_action(robot, env: WarehouseEnv) -> int:
         needs_charge = robot.battery / robot.max_battery < low_battery_threshold
         
         if needs_charge or robot.state == RobotState.RETURNING_TO_CHARGE:
-            if env.charging_stations:
-                nearest_charging = min(env.charging_stations, 
-                                     key=lambda p: robot.get_distance_to(p))
-                
-                if robot.is_at_position(nearest_charging, tolerance=0):
+            assigned = env.get_charging_station_for_robot(robot.robot_id)
+            if assigned:
+                if robot.is_at_position(assigned, tolerance=0):
                     return 4  # 已在充电站，等待充电
-                
-                dx = nearest_charging[0] - current_pos[0]
-                dy = nearest_charging[1] - current_pos[1]
-                
-                if abs(dx) > abs(dy):
-                    preferred_action = 1 if dx > 0 else 3
-                elif dy != 0:
-                    preferred_action = 2 if dy > 0 else 0
-                else:
-                    return 4
-                
-                # 检查是否可通行
-                action_deltas = {0: (0, -1), 1: (1, 0), 2: (0, 1), 3: (-1, 0), 4: (0, 0)}
-                dx_move, dy_move = action_deltas[preferred_action]
-                new_x = current_pos[0] + dx_move
-                new_y = current_pos[1] + dy_move
-                
-                if (0 <= new_x < env.width and 0 <= new_y < env.height and
-                    env.grid[new_y, new_x] not in (1, 2)):
-                    return preferred_action
-                else:
-                    # 尝试其他方向
-                    for alt_action in [2 if dy > 0 else 0, 1 if dx > 0 else 3, 4]:
-                        if alt_action == 4:
-                            return 4
-                        dx_alt, dy_alt = action_deltas[alt_action]
-                        new_x_alt = current_pos[0] + dx_alt
-                        new_y_alt = current_pos[1] + dy_alt
-                        if (0 <= new_x_alt < env.width and 0 <= new_y_alt < env.height and
-                            env.grid[new_y_alt, new_x_alt] not in (1, 2)):
-                            return alt_action
-                    return 4
-            else:
-                return 4
+                occupied = {r.position for r in env.robots if r.robot_id != robot.robot_id}
+                path = astar_path(
+                    env.grid, env.width, env.height,
+                    current_pos, assigned,
+                    occupied=occupied,
+                    allow_goal_on_shelf=False,
+                )
+                if path:
+                    return path_to_action(path)
+            return 4
+        
+        # 交付后须离开到“所有工作站整体”至少 3 格以外；若 3 格有机器人则试 4 格，以此类推
+        ws_positions = getattr(env.warehouse_config, 'workstation_positions', None) or []
+        if getattr(robot, 'last_dropoff_workstation', None) and ws_positions:
+            min_dist = min(robot.get_distance_to((wx, wy)) for (wx, wy) in ws_positions)
+            if min_dist < LEAVE_WORKSTATION_MIN_DISTANCE:
+                occupied = {r.position for r in env.robots if r.robot_id != robot.robot_id}
+                max_d = max(env.width, env.height)
+                for d in range(LEAVE_WORKSTATION_MIN_DISTANCE, max_d + 1):
+                    # 候选格：从当前交付站沿四向取距离 d 的格
+                    wx, wy = robot.last_dropoff_workstation[0], robot.last_dropoff_workstation[1]
+                    candidates = [
+                        (min(env.width - 1, wx + d), wy),
+                        (max(0, wx - d), wy),
+                        (wx, min(env.height - 1, wy + d)),
+                        (wx, max(0, wy - d)),
+                    ]
+                    for target in candidates:
+                        # 目标须与所有工作站都至少 3 格
+                        if any(abs(target[0] - twx) + abs(target[1] - twy) < LEAVE_WORKSTATION_MIN_DISTANCE for (twx, twy) in ws_positions):
+                            continue
+                        if target in occupied:
+                            continue
+                        path = astar_path(
+                            env.grid, env.width, env.height,
+                            current_pos, target,
+                            occupied=occupied,
+                            allow_goal_on_shelf=False,
+                        )
+                        if path:
+                            return path_to_action(path)
         
         # 不需要充电，如果机器人在工作站或充电站，尝试离开
         is_at_workstation = env.grid[current_pos[1], current_pos[0]] == 3

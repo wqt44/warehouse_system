@@ -27,6 +27,8 @@ def astar_path(
         allow_goal_on_shelf: 若 True，则 goal 所在格视为可通行（用于取货点在货架上）
     """
     occupied = occupied or set()
+    goal = (int(goal[0]), int(goal[1]))
+    start = (int(start[0]), int(start[1]))
     if start == goal:
         return [start]
 
@@ -38,7 +40,10 @@ def astar_path(
         if (x, y) == goal and allow_goal_on_shelf:
             return True
         v = grid[y, x]
-        return v not in (1, 2)  # 可通行：非障碍、非货架（或上面已处理 goal）
+        # 工作站(3)、充电站(4)：仅当该格为目标时可通行，机器人只能进入对应编号的站
+        if v == 3 or v == 4:
+            return (x, y) == goal
+        return v not in (1, 2)  # 可通行：非障碍、非货架
 
     # (f, counter, (x,y), path) 用 counter 避免比较 tuple
     counter = 0

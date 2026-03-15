@@ -13,6 +13,9 @@ from env.observation import ObservationSpace
 from env.reward import RewardFunction
 from config import WarehouseConfig, RobotConfig, ObservationConfig, RewardConfig
 
+# 交付完成后机器人须离开到距该工作站至少 N 格
+LEAVE_WORKSTATION_MIN_DISTANCE = 3
+
 
 class WarehouseEnv(gym.Env):
     """仓库多智能体环境"""
@@ -94,53 +97,57 @@ class WarehouseEnv(gym.Env):
         
         # 设置充电站
         if self.warehouse_config.charging_stations is not None:
-            # 使用自定义充电站位置
+            # 使用自定义充电站位置（来自 interactive_config 等）
             charging_stations = []
             for pos in self.warehouse_config.charging_stations:
                 x, y = pos
-                # 确保不超出边界
                 x = max(0, min(x, self.width - 1))
                 y = max(0, min(y, self.height - 1))
-                if self.grid[y, x] not in (1, 2):  # 可通行（非障碍物、非货架）
+                if self.grid[y, x] not in (1, 2):
                     self.grid[y, x] = 4
                     charging_stations.append((x, y))
             self.charging_stations = charging_stations
         else:
             # 自动在工作站附近生成充电站
             charging_stations = []
-            for pos in self.warehouse_config.workstation_positions:
+            for pos in self.warehouse_config.workstation_positions or []:
                 x, y = pos
-                # 在工作站周围添加充电站
                 for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     cx, cy = x + dx, y + dy
-                    if (0 <= cx < self.width and 0 <= cy < self.height and 
-                        self.grid[cy, cx] == 0):
+                    if (0 <= cx < self.width and 0 <= cy < self.height and
+                            self.grid[cy, cx] == 0):
                         self.grid[cy, cx] = 4
                         charging_stations.append((cx, cy))
                         break
             self.charging_stations = charging_stations
+        # 若仍无充电站（如配置未放置且无工作站），在角落等可通行格补至少一个，避免机器人永远无法充电
+        if not self.charging_stations:
+            for cy in range(self.height):
+                for cx in range(self.width):
+                    if self.grid[cy, cx] == 0:
+                        self.grid[cy, cx] = 4
+                        self.charging_stations = [(cx, cy)]
+                        break
+                if self.charging_stations:
+                    break
     
     def _initialize_robots(self):
-        """初始化机器人"""
+        """初始化机器人（每机占一格，不重复；可通行格含空地、工作站、充电站）"""
         self.robots = []
         valid_positions = []
-        
-        # 找到所有可通行位置（非障碍物、非货架）
         for y in range(self.height):
             for x in range(self.width):
-                if self.grid[y, x] == 0:  # 空地
+                v = self.grid[y, x]
+                if v in (0, 3, 4):  # 空地、工作站、充电站均可作为出生点
                     valid_positions.append((x, y))
-        
-        # 随机选择机器人初始位置
-        start_positions = random.sample(valid_positions, 
-                                       min(self.robot_config.num_robots, 
-                                           len(valid_positions)))
-        
-        for i in range(self.robot_config.num_robots):
-            pos = start_positions[i] if i < len(start_positions) else valid_positions[0]
+        if not valid_positions:
+            valid_positions = [(0, 0)]  # fallback
+        n = min(self.robot_config.num_robots, len(valid_positions))
+        start_positions = random.sample(valid_positions, n)
+        for i in range(n):
             robot = Robot(
                 robot_id=i,
-                position=pos,
+                position=start_positions[i],
                 battery=self.robot_config.max_battery,
                 max_battery=self.robot_config.max_battery
             )
@@ -236,8 +243,67 @@ class WarehouseEnv(gym.Env):
             return robot_id_a
         return max(robot_id_a, robot_id_b)
     
+    def _is_pickup_robot(self, robot_id: int) -> bool:
+        r = self.robots[robot_id]
+        return r.state in (RobotState.MOVING_TO_PICKUP, RobotState.PICKING_UP)
+    
+    def _is_delivery_robot(self, robot_id: int) -> bool:
+        r = self.robots[robot_id]
+        return r.state in (RobotState.MOVING_TO_DROPOFF, RobotState.DROPPING_OFF)
+    
+    def _is_charging_bound_robot(self, robot_id: int) -> bool:
+        """是否正在去充电站（返回充电站途中）"""
+        return self.robots[robot_id].state == RobotState.RETURNING_TO_CHARGE
+    
+    def _has_task_robot(self, robot_id: int) -> bool:
+        """是否有任务且正在取/送货（取货或送货状态）"""
+        r = self.robots[robot_id]
+        return (
+            r.current_task is not None
+            and r.state in (RobotState.MOVING_TO_PICKUP, RobotState.PICKING_UP,
+                            RobotState.MOVING_TO_DROPOFF, RobotState.DROPPING_OFF)
+        )
+    
+    def _pickup_step_aside_position(self, pickup_id: int,
+                                    current_positions: Dict[int, Tuple[int, int]],
+                                    new_positions: Dict[int, Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+        """取货机器人向左或右让一步；若两侧都不可走则后退一步，直到某一侧可走（本步优先左/右，否则后退）。"""
+        cur = current_positions[pickup_id]
+        intended = new_positions.get(pickup_id, cur)
+        occupied = set(current_positions.values())
+        for rid, pos in new_positions.items():
+            if rid != pickup_id:
+                occupied.add(pos)
+        # 先试左/右
+        for dx, dy in [(1, 0), (-1, 0)]:
+            ax, ay = cur[0] + dx, cur[1] + dy
+            if not (0 <= ax < self.width and 0 <= ay < self.height):
+                continue
+            if self.grid[ay, ax] in (1, 2):
+                continue
+            if (ax, ay) in occupied:
+                continue
+            return (ax, ay)
+        # 两侧都不可走则后退一步（沿意图方向的反向）；后续步会继续尝试左/右或再退
+        back = (2 * cur[0] - intended[0], 2 * cur[1] - intended[1])
+        bx, by = back
+        if 0 <= bx < self.width and 0 <= by < self.height and self.grid[by, bx] not in (1, 2) and back not in occupied:
+            return back
+        return None
+    
+    def get_charging_station_for_robot(self, robot_id: int):
+        """返回该机器人允许使用的充电站位置（编号与己对应：robot_id % 充电站数），不足时取余。"""
+        if not self.charging_stations:
+            return None
+        n = len(self.charging_stations)
+        idx = robot_id % n
+        return self.charging_stations[idx]
+    
     def _resolve_predictive_collisions(self, new_positions: Dict[int, Tuple[int, int]]) -> Dict[int, Tuple[int, int]]:
-        """预测碰撞并提前礼让：同目标、互换位置等冲突，让应礼让者本步等待"""
+        """预测碰撞并提前礼让：同目标、对穿等冲突。
+        取货与送货同路径：送货等待，取货左(右)让或后退。
+        去充电与取(送)货同路径：去充电的等待，取(送)货的左(右)让或后退。
+        有任务与无任务同路径：无任务的左(右)让或后退，有任务的保持原计划。"""
         current_positions = {r.robot_id: r.position for r in self.robots}
         new_positions = dict(new_positions)
         while True:
@@ -252,12 +318,76 @@ class WarehouseEnv(gym.Env):
                     new_i, new_j = new_positions[i], new_positions[j]
                     # 同目标
                     if new_i == new_j:
+                        pickup_id, delivery_id = None, None
+                        if self._is_pickup_robot(i) and self._is_delivery_robot(j):
+                            pickup_id, delivery_id = i, j
+                        elif self._is_pickup_robot(j) and self._is_delivery_robot(i):
+                            pickup_id, delivery_id = j, i
+                        if pickup_id is not None and delivery_id is not None:
+                            new_positions[delivery_id] = current_positions[delivery_id]
+                            aside = self._pickup_step_aside_position(pickup_id, current_positions, new_positions)
+                            new_positions[pickup_id] = aside if aside is not None else current_positions[pickup_id]
+                            conflict_found = True
+                            break
+                        charging_id, task_id = None, None
+                        if self._is_charging_bound_robot(i) and (self._is_pickup_robot(j) or self._is_delivery_robot(j)):
+                            charging_id, task_id = i, j
+                        elif self._is_charging_bound_robot(j) and (self._is_pickup_robot(i) or self._is_delivery_robot(i)):
+                            charging_id, task_id = j, i
+                        if charging_id is not None and task_id is not None:
+                            new_positions[charging_id] = current_positions[charging_id]
+                            aside = self._pickup_step_aside_position(task_id, current_positions, new_positions)
+                            new_positions[task_id] = aside if aside is not None else current_positions[task_id]
+                            conflict_found = True
+                            break
+                        task_id, idle_id = None, None
+                        if self._has_task_robot(i) and not self._has_task_robot(j):
+                            task_id, idle_id = i, j
+                        elif self._has_task_robot(j) and not self._has_task_robot(i):
+                            task_id, idle_id = j, i
+                        if task_id is not None and idle_id is not None:
+                            aside = self._pickup_step_aside_position(idle_id, current_positions, new_positions)
+                            new_positions[idle_id] = aside if aside is not None else current_positions[idle_id]
+                            conflict_found = True
+                            break
                         yielder = self._choose_yielder(i, j)
                         new_positions[yielder] = current_positions[yielder]
                         conflict_found = True
                         break
                     # 互换位置（对穿）
                     if new_i == pos_j and new_j == pos_i:
+                        pickup_id, delivery_id = None, None
+                        if self._is_pickup_robot(i) and self._is_delivery_robot(j):
+                            pickup_id, delivery_id = i, j
+                        elif self._is_pickup_robot(j) and self._is_delivery_robot(i):
+                            pickup_id, delivery_id = j, i
+                        if pickup_id is not None and delivery_id is not None:
+                            new_positions[delivery_id] = current_positions[delivery_id]
+                            aside = self._pickup_step_aside_position(pickup_id, current_positions, new_positions)
+                            new_positions[pickup_id] = aside if aside is not None else current_positions[pickup_id]
+                            conflict_found = True
+                            break
+                        charging_id, task_id = None, None
+                        if self._is_charging_bound_robot(i) and (self._is_pickup_robot(j) or self._is_delivery_robot(j)):
+                            charging_id, task_id = i, j
+                        elif self._is_charging_bound_robot(j) and (self._is_pickup_robot(i) or self._is_delivery_robot(i)):
+                            charging_id, task_id = j, i
+                        if charging_id is not None and task_id is not None:
+                            new_positions[charging_id] = current_positions[charging_id]
+                            aside = self._pickup_step_aside_position(task_id, current_positions, new_positions)
+                            new_positions[task_id] = aside if aside is not None else current_positions[task_id]
+                            conflict_found = True
+                            break
+                        task_id, idle_id = None, None
+                        if self._has_task_robot(i) and not self._has_task_robot(j):
+                            task_id, idle_id = i, j
+                        elif self._has_task_robot(j) and not self._has_task_robot(i):
+                            task_id, idle_id = j, i
+                        if task_id is not None and idle_id is not None:
+                            aside = self._pickup_step_aside_position(idle_id, current_positions, new_positions)
+                            new_positions[idle_id] = aside if aside is not None else current_positions[idle_id]
+                            conflict_found = True
+                            break
                         yielder = self._choose_yielder(i, j)
                         new_positions[yielder] = current_positions[yielder]
                         conflict_found = True
@@ -297,7 +427,7 @@ class WarehouseEnv(gym.Env):
             new_y = robot.position[1] + dy
             
             # 检查边界和障碍物
-            # 机器人可进入：空地(0)、工作站(3)、充电站(4)；货架(2)仅当前往取货点时允许进入
+            # 机器人可进入：空地(0)、充电站(4)；货架(2)仅取货点可进；工作站(3)仅当前任务的送货站可进
             if (0 <= new_x < self.width and 0 <= new_y < self.height):
                 grid_value = self.grid[new_y, new_x]
                 if grid_value == 1:
@@ -306,6 +436,20 @@ class WarehouseEnv(gym.Env):
                     # 货架：仅当目标格为当前任务的取货点且处于“前往取货”状态时可进入
                     if (robot.current_task is not None and robot.state == RobotState.MOVING_TO_PICKUP and
                             robot.current_task.pickup_location == (new_x, new_y)):
+                        new_positions[robot_id] = (new_x, new_y)
+                    else:
+                        new_positions[robot_id] = robot.position
+                elif grid_value == 3:
+                    # 工作站：仅当为目标任务的送货点时允许进入，机器人只能进入货物对应工作站
+                    if (robot.current_task is not None and
+                            robot.current_task.dropoff_location == (new_x, new_y)):
+                        new_positions[robot_id] = (new_x, new_y)
+                    else:
+                        new_positions[robot_id] = robot.position
+                elif grid_value == 4:
+                    # 充电站：仅当为与本机编号对应的充电站时可进入（robot_id % 充电站数）
+                    assigned = self.get_charging_station_for_robot(robot_id)
+                    if assigned and (new_x, new_y) == assigned:
                         new_positions[robot_id] = (new_x, new_y)
                     else:
                         new_positions[robot_id] = robot.position
@@ -472,41 +616,22 @@ class WarehouseEnv(gym.Env):
     def _update_robots(self):
         """更新机器人状态"""
         for robot in self.robots:
-            # 先检查是否在充电站，如果在充电站且状态不是CHARGING，自动切换到CHARGING
-            if self.charging_stations:
-                is_at_charging_station = any(
-                    robot.is_at_position(cs, tolerance=0) for cs in self.charging_stations
-                )
-                if is_at_charging_station and robot.state != RobotState.CHARGING:
-                    # 如果机器人在充电站但状态不是CHARGING，且没有任务或电量不足，切换到CHARGING
-                    # 但是，如果机器人已经充完电（电量 >= 90%），不应该强制设置为CHARGING
-                    if robot.battery / robot.max_battery < 0.9:
-                        if robot.current_task is None or robot.battery / robot.max_battery < 0.1:
-                            robot.state = RobotState.CHARGING
+            # 仅当在本机编号对应的充电站时，才视为在充电站并切换到CHARGING（可拿着货充电）
+            assigned_cs = self.get_charging_station_for_robot(robot.robot_id)
+            if assigned_cs and robot.is_at_position(assigned_cs, tolerance=0) and robot.state != RobotState.CHARGING:
+                if robot.battery / robot.max_battery < 0.9:
+                    robot.state = RobotState.CHARGING
             
             # 消耗电量（充电时不消耗）
             robot.consume_battery(self.robot_config.battery_consumption_rate)
             
-            # 检查是否需要充电
-            # 如果机器人没有任务且电量不足，自动去充电
-            if robot.current_task is None and robot.needs_charging() and robot.state != RobotState.CHARGING:
-                # 寻找最近的充电站
-                if self.charging_stations:
-                    nearest_charging = min(self.charging_stations, 
-                                         key=lambda p: robot.get_distance_to(p))
-                    if robot.is_at_position(nearest_charging, tolerance=0):
-                        robot.state = RobotState.CHARGING
-                    else:
-                        robot.state = RobotState.RETURNING_TO_CHARGE
-            # 如果有任务但电量严重不足（低于20%），归还任务并去充电
-            elif robot.current_task is not None and robot.battery / robot.max_battery < 0.2:
-                # 归还任务
-                robot.cancel_task()
-                # 去充电
-                if self.charging_stations:
-                    nearest_charging = min(self.charging_stations, 
-                                         key=lambda p: robot.get_distance_to(p))
-                    if robot.is_at_position(nearest_charging, tolerance=0):
+            # 检查是否需要充电（无任务或拿着货均可去充电；有任务时暂存状态，充完后恢复）
+            if robot.needs_charging() and robot.state not in (RobotState.CHARGING, RobotState.RETURNING_TO_CHARGE):
+                assigned = self.get_charging_station_for_robot(robot.robot_id)
+                if assigned:
+                    if robot.current_task is not None:
+                        robot.state_before_charge = robot.state
+                    if robot.is_at_position(assigned, tolerance=0):
                         robot.state = RobotState.CHARGING
                     else:
                         robot.state = RobotState.RETURNING_TO_CHARGE
@@ -515,12 +640,14 @@ class WarehouseEnv(gym.Env):
             if robot.state == RobotState.CHARGING:
                 robot.charge(self.robot_config.charging_rate)
                 if robot.battery >= robot.max_battery * 0.9:
-                    # 充满电后，初始化机器人状态，清除所有任务相关状态
-                    robot.state = RobotState.IDLE
-                    robot.task_progress = 0.0
-                    # 确保任务已被清除（双重检查）
-                    if robot.current_task is not None:
-                        robot.cancel_task()
+                    if robot.state_before_charge is not None:
+                        robot.state = robot.state_before_charge
+                        robot.state_before_charge = None
+                    else:
+                        robot.state = RobotState.IDLE
+                        robot.task_progress = 0.0
+                        if robot.current_task is not None:
+                            robot.cancel_task()
             
             # 更新任务状态（只有在非充电相关状态时才更新）
             if robot.current_task and robot.state not in [RobotState.CHARGING, RobotState.RETURNING_TO_CHARGE]:
@@ -551,7 +678,19 @@ class WarehouseEnv(gym.Env):
                 
                 elif robot.state == RobotState.DROPPING_OFF:
                     robot.task_progress = 1.0
+                    dropoff_loc = task.dropoff_location
                     robot.complete_task()
+                    robot.last_dropoff_workstation = dropoff_loc
+        
+        # 已离开到“所有工作站整体”3 格以外则清除“须离开”标记
+        ws_positions = self.warehouse_config.workstation_positions or []
+        for robot in self.robots:
+            if robot.last_dropoff_workstation is not None and ws_positions:
+                min_dist = min(robot.get_distance_to((wx, wy)) for (wx, wy) in ws_positions)
+                if min_dist >= LEAVE_WORKSTATION_MIN_DISTANCE:
+                    robot.last_dropoff_workstation = None
+            elif robot.last_dropoff_workstation is not None and not ws_positions:
+                robot.last_dropoff_workstation = None
     
     def _spawn_tasks(self):
         """生成新任务：取货点在货架上，机器人需进入货架取货后退回通道"""
@@ -574,7 +713,7 @@ class WarehouseEnv(gym.Env):
                 if shelf_positions and workstation_positions:
                     pickup = random.choice(shelf_positions)
                     dropoff = random.choice(workstation_positions)
-                    
+                    dropoff = (int(dropoff[0]), int(dropoff[1]))
                     task = Task(
                         task_id=self.task_counter,
                         task_type=TaskType.PICKUP,

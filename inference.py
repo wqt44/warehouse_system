@@ -22,6 +22,7 @@ from baselines.optimization import BaselineComparison
 from agents.robot import RobotState
 from utils.env_utils import create_env
 from utils.pathfinding import astar_path, path_to_action
+from env.warehouse_env import LEAVE_WORKSTATION_MIN_DISTANCE
 
 
 def _plot_and_save_paths(paths: dict, grid: np.ndarray, width: int, height: int, save_path: str):
@@ -338,18 +339,19 @@ def run_inference(model_path: str, num_episodes: int = 1,
                         actions[robot.robot_id] = 4  # 等待充电
                         continue
                     elif robot.state == RobotState.RETURNING_TO_CHARGE:
-                        # 前往最近的充电站
-                        if env.charging_stations:
-                            nearest_charging = min(env.charging_stations, 
-                                                 key=lambda p: robot.get_distance_to(p))
-                            dx = nearest_charging[0] - robot.position[0]
-                            dy = nearest_charging[1] - robot.position[1]
-                            if abs(dx) > abs(dy):
-                                actions[robot.robot_id] = 1 if dx > 0 else 3
-                            elif dy != 0:
-                                actions[robot.robot_id] = 2 if dy > 0 else 0
-                            else:
+                        assigned = env.get_charging_station_for_robot(robot.robot_id)
+                        if assigned:
+                            if robot.is_at_position(assigned, tolerance=0):
                                 actions[robot.robot_id] = 4
+                            else:
+                                occupied = {r.position for r in env.robots if r.robot_id != robot.robot_id}
+                                path = astar_path(
+                                    env.grid, env.width, env.height,
+                                    robot.position, assigned,
+                                    occupied=occupied,
+                                    allow_goal_on_shelf=False,
+                                )
+                                actions[robot.robot_id] = path_to_action(path) if path else 4
                         else:
                             actions[robot.robot_id] = 4
                         continue
@@ -367,62 +369,60 @@ def run_inference(model_path: str, num_episodes: int = 1,
                             actions[robot.robot_id] = 4  # 等待充电
                             continue
                         
-                        # 如果需要充电，前往充电站
+                        # 如果需要充电，用 A* 寻路到与己编号对应的充电站（与任务寻路一致）
                         if needs_charge or robot.state == RobotState.RETURNING_TO_CHARGE:
-                            if env.charging_stations:
-                                # 找到最近的充电站
-                                nearest_charging = min(env.charging_stations, 
-                                                     key=lambda p: robot.get_distance_to(p))
-                                
-                                # 检查是否已经在充电站
-                                if robot.is_at_position(nearest_charging, tolerance=0):
+                            assigned = env.get_charging_station_for_robot(robot.robot_id)
+                            if assigned:
+                                if robot.is_at_position(assigned, tolerance=0):
                                     actions[robot.robot_id] = 4  # 已在充电站，等待充电
                                 else:
-                                    # 前往充电站
-                                    dx = nearest_charging[0] - current_pos[0]
-                                    dy = nearest_charging[1] - current_pos[1]
-                                    
-                                    # 优先选择主要方向
-                                    if abs(dx) > abs(dy):
-                                        preferred_action = 1 if dx > 0 else 3  # 右或左
-                                    elif dy != 0:
-                                        preferred_action = 2 if dy > 0 else 0  # 下或上
-                                    else:
-                                        preferred_action = 4
-                                    
-                                    # 检查首选动作是否可通行
-                                    if preferred_action != 4:
-                                        action_deltas = {0: (0, -1), 1: (1, 0), 2: (0, 1), 3: (-1, 0), 4: (0, 0)}
-                                        dx_move, dy_move = action_deltas[preferred_action]
-                                        new_x = current_pos[0] + dx_move
-                                        new_y = current_pos[1] + dy_move
-                                        
-                                        if (0 <= new_x < env.width and 0 <= new_y < env.height and
-                                            env.grid[new_y, new_x] not in (1, 2)):
-                                            actions[robot.robot_id] = preferred_action
-                                        else:
-                                            # 尝试其他方向
-                                            if abs(dx) > abs(dy):
-                                                alt_action = 2 if dy > 0 else 0 if dy < 0 else 4
-                                            else:
-                                                alt_action = 1 if dx > 0 else 3 if dx < 0 else 4
-                                            
-                                            if alt_action != 4:
-                                                dx_alt, dy_alt = action_deltas[alt_action]
-                                                new_x_alt = current_pos[0] + dx_alt
-                                                new_y_alt = current_pos[1] + dy_alt
-                                                if (0 <= new_x_alt < env.width and 0 <= new_y_alt < env.height and
-                                                    env.grid[new_y_alt, new_x_alt] not in (1, 2)):
-                                                    actions[robot.robot_id] = alt_action
-                                                else:
-                                                    actions[robot.robot_id] = 4
-                                            else:
-                                                actions[robot.robot_id] = 4
-                                    else:
-                                        actions[robot.robot_id] = 4
+                                    occupied = {r.position for r in env.robots if r.robot_id != robot.robot_id}
+                                    path = astar_path(
+                                        env.grid, env.width, env.height,
+                                        current_pos, assigned,
+                                        occupied=occupied,
+                                        allow_goal_on_shelf=False,
+                                    )
+                                    actions[robot.robot_id] = path_to_action(path) if path else 4
                             else:
                                 actions[robot.robot_id] = 4  # 没有充电站，等待
                             continue
+                        
+                        # 交付后须离开到“所有工作站整体”至少 3 格以外；若 3 格有机器人则试 4 格，以此类推
+                        ws_positions = getattr(env.warehouse_config, 'workstation_positions', None) or []
+                        if getattr(robot, 'last_dropoff_workstation', None) and ws_positions:
+                            min_dist = min(robot.get_distance_to((wx, wy)) for (wx, wy) in ws_positions)
+                            if min_dist < LEAVE_WORKSTATION_MIN_DISTANCE:
+                                occupied = {r.position for r in env.robots if r.robot_id != robot.robot_id}
+                                max_d = max(env.width, env.height)
+                                for d in range(LEAVE_WORKSTATION_MIN_DISTANCE, max_d + 1):
+                                    wx, wy = robot.last_dropoff_workstation[0], robot.last_dropoff_workstation[1]
+                                    candidates = [
+                                        (min(env.width - 1, wx + d), wy),
+                                        (max(0, wx - d), wy),
+                                        (wx, min(env.height - 1, wy + d)),
+                                        (wx, max(0, wy - d)),
+                                    ]
+                                    for target in candidates:
+                                        if any(abs(target[0] - twx) + abs(target[1] - twy) < LEAVE_WORKSTATION_MIN_DISTANCE for (twx, twy) in ws_positions):
+                                            continue
+                                        if target in occupied:
+                                            continue
+                                        path = astar_path(
+                                            env.grid, env.width, env.height,
+                                            current_pos, target,
+                                            occupied=occupied,
+                                            allow_goal_on_shelf=False,
+                                        )
+                                        if path:
+                                            actions[robot.robot_id] = path_to_action(path)
+                                            break
+                                    else:
+                                        continue
+                                    break
+                                else:
+                                    actions[robot.robot_id] = 4
+                                continue
                         
                         # 不需要充电，如果机器人在工作站或充电站，尝试离开
                         is_at_workstation = env.grid[current_pos[1], current_pos[0]] == 3
